@@ -1,0 +1,39 @@
+{
+  "name": "blast-radius-analyzer",
+  "version": "1.2.1",
+  "description": "Analyze code change impact and blast radius - 改动影响范围分析器",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "blast-radius": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "analyze": "node dist/index.js"
+  },
+  "keywords": [
+    "blast-radius",
+    "impact-analysis",
+    "code-analysis",
+    "dependency-tracking",
+    "data-flow",
+    "typescript"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "dependencies": {
+    "ts-morph": "^25.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
