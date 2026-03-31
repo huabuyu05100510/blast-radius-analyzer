@@ -30,6 +30,7 @@ function parseArgs(argv) {
     let format = 'text';
     let useCache = true;
     let clearCache = false;
+    let autoDetect = false; // 自动检测 git diff
     let threshold = undefined;
     for (let i = 2; i < argv.length; i++) {
         const arg = argv[i];
@@ -80,6 +81,9 @@ function parseArgs(argv) {
         else if (arg === '--clear-cache') {
             clearCache = true;
         }
+        else if (arg === '--auto' || arg === '-a') {
+            autoDetect = true;
+        }
         else if (arg === '--threshold' && argv[i + 1]) {
             // 解析阈值: --threshold files:5,score:100,typeErrors:0
             const thresholdStr = argv[++i];
@@ -115,6 +119,7 @@ function parseArgs(argv) {
         format,
         useCache,
         clearCache,
+        autoDetect,
         threshold: threshold,
     };
 }
@@ -132,6 +137,7 @@ Options:
   -c, --change <file>         File that changed (can be specified multiple times)
   --symbol <name>             Specific symbol that changed (function/class name)
   --type <type>               Change type: add|modify|delete|rename (default: modify)
+  -a, --auto                  Auto-detect changes via git diff
   --max-depth <n>             Maximum analysis depth (default: 10)
   -t, --include-tests         Include test files in analysis
   -o, --output <file>         Output file (auto-detect format from extension)
@@ -151,6 +157,9 @@ CI/CD Examples:
   blast-radius -p ./src -c src/api/task.ts --threshold files:3 -o result.json
 
 Examples:
+  # Auto-detect all changes via git diff
+  blast-radius -p ./src --auto
+
   # Analyze a single file change
   blast-radius -p ./src -c src/api/user.ts
 
@@ -760,11 +769,169 @@ function formatHtml(scope, callChains, callStackView, typeFlowResult, dataFlowRe
 </html>`;
     return html;
 }
+/**
+ * 使用 git diff 自动检测改动的文件和符号
+ */
+async function autoDetectChanges(projectRoot) {
+    const { execSync } = await import('child_process');
+    try {
+        // 获取 staged + unstaged 的改动
+        const diffOutput = execSync('git diff --cached --name-only HEAD 2>/dev/null || git diff --name-only HEAD 2>/dev/null || git diff --name-only 2>/dev/null', {
+            cwd: projectRoot,
+            encoding: 'utf8',
+            stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        const changedFiles = diffOutput.trim().split('\n').filter(f => f.trim());
+        if (changedFiles.length === 0 || changedFiles[0] === '') {
+            // 没有 git 改动，检查工作区
+            const unstaged = execSync('git diff --name-only 2>/dev/null || echo ""', {
+                cwd: projectRoot,
+                encoding: 'utf8',
+            }).trim().split('\n').filter(f => f.trim());
+            if (unstaged.length === 0 || unstaged[0] === '') {
+                return [];
+            }
+            changedFiles.length = 0;
+            changedFiles.push(...unstaged);
+        }
+        // 过滤只保留 TypeScript/JavaScript 文件
+        const codeFiles = changedFiles.filter(f => /\.(ts|tsx|js|jsx)$/.test(f) && !f.includes('node_modules'));
+        if (codeFiles.length === 0) {
+            return [];
+        }
+        // 获取每个文件的详细 diff，包括函数/变量名
+        const changedSymbols = [];
+        for (const file of codeFiles) {
+            try {
+                // 获取文件的 diff
+                const fileDiff = execSync(`git diff HEAD -- "${file}" 2>/dev/null || git diff -- "${file}" 2>/dev/null || echo ""`, {
+                    cwd: projectRoot,
+                    encoding: 'utf8',
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                });
+                // 解析 diff 中的符号 (函数名、变量名等)
+                const symbols = parseDiffSymbols(fileDiff, file);
+                if (symbols.length > 0) {
+                    for (const sym of symbols) {
+                        changedSymbols.push({
+                            file: path.resolve(projectRoot, file),
+                            symbol: sym,
+                            type: 'modify',
+                            diff: fileDiff,
+                        });
+                    }
+                }
+                else {
+                    // 如果无法解析符号，仍添加文件
+                    changedSymbols.push({
+                        file: path.resolve(projectRoot, file),
+                        symbol: '', // 空符号表示分析整个文件
+                        type: 'modify',
+                        diff: fileDiff,
+                    });
+                }
+            }
+            catch {
+                // 单个文件出错继续处理其他的
+            }
+        }
+        return changedSymbols;
+    }
+    catch (error) {
+        console.error('⚠️  无法获取 git diff:', error.message);
+        return [];
+    }
+}
+/**
+ * 从 diff 中解析改动的符号名
+ */
+function parseDiffSymbols(diffContent, file) {
+    const symbols = [];
+    const lines = diffContent.split('\n');
+    // 匹配函数定义: +functionName, +const functionName, +export functionName
+    const functionPattern = /^[+]export\s+(?:async\s+)?(?:function\s+(\w+)|const\s+(\w+)|(\w+)\s*=)/;
+    // 匹配变量声明: +export const name, +export let name, +export var name
+    const constPattern = /^[+]export\s+(?:const|let|var)\s+(\w+)/;
+    // 匹配类型定义: +export type Name, +export interface Name
+    const typePattern = /^[+]export\s+(?:type|interface|class|enum)\s+(\w+)/;
+    // 匹配 class 定义: +class ClassName
+    const classPattern = /^[+]class\s+(\w+)/;
+    for (const line of lines) {
+        // 跳过 diff header
+        if (line.startsWith('@@') || line.startsWith('---') || line.startsWith('+++') || line.startsWith('diff')) {
+            continue;
+        }
+        // 匹配函数
+        let match = line.match(functionPattern);
+        if (match) {
+            const name = match[1] || match[2] || match[3];
+            if (name && !symbols.includes(name)) {
+                symbols.push(name);
+            }
+        }
+        // 匹配 const/let/var
+        match = line.match(constPattern);
+        if (match && match[1]) {
+            if (!symbols.includes(match[1])) {
+                symbols.push(match[1]);
+            }
+        }
+        // 匹配类型
+        match = line.match(typePattern);
+        if (match && match[1]) {
+            if (!symbols.includes(match[1])) {
+                symbols.push(match[1]);
+            }
+        }
+        // 匹配 class
+        match = line.match(classPattern);
+        if (match && match[1]) {
+            if (!symbols.includes(match[1])) {
+                symbols.push(match[1]);
+            }
+        }
+    }
+    return symbols;
+}
 // ─── Main ────────────────────────────────────────────────────────────────────
 async function main() {
     const args = parseArgs(process.argv);
+    // 如果指定了 --auto，自动检测 git 改动
+    if (args.autoDetect) {
+        console.log('🔍 Auto-detecting changes via git diff...');
+        const detectedChanges = await autoDetectChanges(args.projectRoot);
+        if (detectedChanges.length === 0) {
+            console.log('✅ No code changes detected (or not a git repository)');
+            process.exit(0);
+        }
+        console.log(`📝 Found ${detectedChanges.length} changed symbol(s):\n`);
+        for (const change of detectedChanges) {
+            const relPath = path.relative(args.projectRoot, change.file);
+            const symDisplay = change.symbol ? `#${change.symbol}` : '(file)';
+            console.log(`   • ${relPath}${symDisplay}`);
+        }
+        console.log('');
+        // 将检测到的改动合并到 args.changes
+        for (const change of detectedChanges) {
+            // 检查是否已存在相同的文件
+            const existing = args.changes.find(c => c.file === change.file);
+            if (existing) {
+                // 如果已有符号，保留；否则添加新符号
+                if (!existing.symbol && change.symbol) {
+                    existing.symbol = change.symbol;
+                }
+            }
+            else {
+                args.changes.push({
+                    file: change.file,
+                    symbol: change.symbol || undefined,
+                    type: change.type,
+                });
+            }
+        }
+    }
     if (args.changes.length === 0) {
-        console.error('❌ Error: No changes specified. Use --change <file>');
+        console.error('❌ Error: No changes specified. Use --change <file> or --auto');
         console.error('   Run with --help for usage information');
         process.exit(1);
     }
